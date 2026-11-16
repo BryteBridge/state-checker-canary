@@ -6,7 +6,7 @@ import pytest
 
 from canary import __main__ as cli
 from canary import batch, issue, pools, states
-from canary.check import Checker, Report
+from canary.check import CaseResult, Checker, Report
 
 
 def _fake_run(ok):
@@ -137,11 +137,16 @@ def _plan(*codes):
 def synced(monkeypatch):
     seen = {}
 
-    def sync(gh, state, *, failed, body, run_url, assignee=None):
-        seen[state.code] = {"failed": failed, "body": body, "assignee": assignee}
+    def sync(gh, state, *, failed, body, run_url, assignee=None, sig="", when=""):
+        seen[state.code] = {"failed": failed, "body": body, "assignee": assignee, "sig": sig}
+        return "ok"
+
+    def sync_outage(gh, *, active, title, body, run_url, assignee=None, sig="", when=""):
+        seen["outage"] = {"active": active, "title": title, "body": body, "sig": sig}
         return "ok"
 
     monkeypatch.setattr(issue, "sync", sync)
+    monkeypatch.setattr(issue, "sync_outage", sync_outage)
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setenv("GH_TOKEN", "tok")
     monkeypatch.setenv("GITHUB_REPOSITORY_OWNER", "someone")
@@ -157,7 +162,8 @@ def test_batch_summarizes_and_syncs_every_planned_state(tmp_path, synced, capsys
     code = cli.main(["batch", "--plan", _plan("az", "ca", "ct"), "--reports", str(tmp_path),
                      "--summary", str(summary), "--issues"])  # fmt: skip
     assert code == 0
-    assert {k: v["failed"] for k, v in synced.items()} == {"az": False, "ca": True, "ct": True}
+    assert {k: v["failed"] for k, v in synced.items() if k != "outage"} == {"az": False, "ca": True, "ct": True}
+    assert "outage" not in synced  # 3 states: a partial batch leaves the outage issue alone
     assert synced["ct"]["assignee"] == "someone" and "the job left no report" in synced["ct"]["body"]
     text = summary.read_text()
     assert "1 of 3 states passed" in text
@@ -210,13 +216,14 @@ def test_plan_refuses_an_empty_selection():
 def test_one_state_issue_error_does_not_stop_the_others(tmp_path, monkeypatch, capsys):
     seen = []
 
-    def sync(gh, state, *, failed, body, run_url, assignee=None):
+    def sync(gh, state, *, failed, body, run_url, assignee=None, sig="", when=""):
         seen.append(state.code)
         if state.code == "az":
             raise issue.GitHubError("POST /issues/3/comments: HTTP 403: locked")
         return "ok"
 
     monkeypatch.setattr(issue, "sync", sync)
+    monkeypatch.setattr(issue, "sync_outage", lambda gh, **kw: "ok")
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setenv("GH_TOKEN", "tok")
     code = cli.main(["batch", "--plan", _plan("az", "ca"), "--reports", str(tmp_path), "--issues"])
@@ -309,3 +316,144 @@ def test_a_pool_line_may_end_with_a_comment(tmp_path):
 def test_a_missing_pool_is_refused(tmp_path):
     with pytest.raises(SystemExit, match="no pool for AZ"):
         pools.load(states.get("az"), tmp_path)
+
+
+# reading back a report with a tolerated lookup
+
+
+def _tolerated_report(**case_changes):
+    case = {"eid": "300", "expect": "verified", "outcome": "technical", "verdict": "unknown",
+            "reason": "TECHNICAL_UNREACHABLE", "attempts": 2, "tolerated": True,
+            "problem": "the registry did not answer (TECHNICAL_UNREACHABLE), twice"} | case_changes  # fmt: skip
+    ok = {"eid": "200", "expect": "verified", "outcome": "verified", "verdict": "eligible", "attempts": 1}
+    return {"state": "AZ", "name": "Arizona", "started_at": "2026-01-01T00:00:00+00:00",
+            "cases": [ok, case, {**ok, "eid": "100"}, {**ok, "eid": "400"}, {**ok, "eid": "500"}],
+            "problems": [], "warnings": ["300: tolerated"], "round_trip": None}  # fmt: skip
+
+
+def test_a_report_with_one_tolerated_lookup_in_five_reads_back_as_passing():
+    report = batch.report_from(_tolerated_report())
+    assert report.ok and report.cases[1].tolerated is True
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"outcome": "verified"}, {"problem": None}, {"tolerated": "yes"}, {"outcome": "not_found"}],
+)
+def test_a_tolerance_that_is_not_an_unanswered_lookup_is_refused(change):
+    with pytest.raises(ValueError, match="tolerated"):
+        batch.report_from(_tolerated_report(**change))
+
+
+def test_more_tolerated_lookups_than_allowed_are_refused():
+    data = _tolerated_report()
+    data["cases"][2] = {**data["cases"][1], "eid": "100"}
+    with pytest.raises(ValueError, match="more than allowed"):
+        batch.report_from(data)
+
+
+# outage
+
+
+def _batch_of(tmp_path, failing, codes=None):
+    codes = codes or [st.code for st in states.STATES]
+    for c in codes:
+        st = states.get(c)
+        problems = ["200: the registry did not answer (TECHNICAL_UNREACHABLE), twice"] if c in failing else []
+        _write(tmp_path / c, Report(c.upper(), st.name, "t", served=st.served, problems=problems),
+               outcome="failure" if c in failing else "success")  # fmt: skip
+    return _plan(*codes)
+
+
+TWELVE = {"ca", "ct", "fl", "nc", "ny", "pa", "va", "wa", "wi", "wy", "ga", "mo"}
+
+
+def test_half_the_states_failing_is_one_outage_and_their_issues_are_left_alone(tmp_path, synced, capsys):
+    plan = _batch_of(tmp_path, failing=TWELVE)
+    summary = tmp_path / "s.md"
+    cli.main(["batch", "--plan", plan, "--reports", str(tmp_path), "--issues", "--summary", str(summary)])
+    assert synced["outage"]["active"] is True and len(synced["outage"]["sig"]) == 12
+    assert synced["outage"]["title"] == "Checker-wide outage: 12 of 24 states failing"
+    assert "| CA California | 200: the registry did not answer" in synced["outage"]["body"]
+    assert not (set(synced) & TWELVE)  # the failing states' issues untouched
+    assert "**Outage:**" in summary.read_text()
+    assert "::error title=Outage::12 states failing together" in capsys.readouterr().out
+
+
+def test_fewer_than_half_failing_is_no_outage(tmp_path, synced):
+    plan = _batch_of(tmp_path, failing=TWELVE - {"mo"})
+    cli.main(["batch", "--plan", plan, "--reports", str(tmp_path), "--issues"])
+    assert synced["outage"]["active"] is False
+    assert synced["ca"]["failed"] is True and synced["ca"]["sig"]
+
+
+def test_a_batch_of_a_few_states_neither_starts_nor_ends_an_outage(tmp_path, synced):
+    plan = _batch_of(tmp_path, failing={"ca", "ct", "fl", "nc", "ny", "pa"}, codes=["ca", "ct", "fl", "nc", "ny", "pa"])
+    cli.main(["batch", "--plan", plan, "--reports", str(tmp_path), "--issues"])
+    assert "outage" not in synced  # the outage issue is not touched either way
+    assert synced["ca"]["failed"] is True  # each state's own issue as usual
+
+
+def test_the_outage_signature_follows_the_kinds_of_failure_not_the_states(tmp_path):
+    def results(failing, problem):
+        out = []
+        for c in failing:
+            rep = Report(c.upper(), states.get(c).name, "t", served=True, problems=[f"200: {problem}"])
+            out.append(batch.StateResult(states.get(c), rep, True))
+        return out
+
+    unanswered = "the registry did not answer (TECHNICAL_UNREACHABLE), twice"
+    a = batch.outage_signature(results(["ca", "ct", "fl"], unanswered), 6)
+    assert a == batch.outage_signature(results(["ca", "ct", "fl", "nc"], unanswered), 6)
+    assert a != batch.outage_signature(results(["ca", "ct", "fl"], "storage did not serve this run's answer back"), 6)
+    assert a != batch.outage_signature(results(["ca", "ct", "fl", "nc", "ny", "pa"], unanswered), 6)  # nearly all
+
+
+def test_the_signature_ignores_which_entities_and_how_the_registry_failed():
+    def result(problems, reason):
+        cases = [
+            CaseResult(p.split(":")[0], "verified", outcome="technical", reason=reason, problem=p.split(": ", 1)[1])
+            for p in problems
+        ]
+        rep = Report("AZ", "Arizona", "t", served=True, cases=cases, problems=problems)
+        return batch.StateResult(states.get("az"), rep, True)
+
+    a = result(["100: the registry did not answer (TECHNICAL_TIMEOUT), twice"], "TECHNICAL_TIMEOUT")
+    unreachable = "the registry did not answer (TECHNICAL_UNREACHABLE), twice"
+    b = result([f"555: {unreachable}", f"777: {unreachable}"], "TECHNICAL_UNREACHABLE")
+    assert batch.signature(a) == batch.signature(b)
+    storage = Report("AZ", "Arizona", "t", served=True,
+                     problems=["200: storage did not serve this run's answer back after 3 tries (R2)"])  # fmt: skip
+    assert batch.signature(batch.StateResult(states.get("az"), storage, True)) != batch.signature(a)
+
+
+# due
+
+
+def test_due_writes_the_output_and_a_notice(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    out = tmp_path / "out"
+    assert cli.main(["due", "--event", "workflow_dispatch", "--github-output", str(out)]) == 0
+    assert out.read_text() == "due=true\n"
+    assert "::notice title=Batch due::" in capsys.readouterr().out
+
+
+def test_a_tolerated_lookup_the_checker_itself_missed_is_refused():
+    with pytest.raises(ValueError, match="tolerated"):
+        batch.report_from(_tolerated_report(checker_missed=True))
+
+
+@pytest.mark.parametrize("change", [{"problem": ["bad"]}, {"reason": 3}, {"outcome": {"x": 1}}])
+def test_a_case_field_that_is_not_text_is_refused(change):
+    with pytest.raises(ValueError, match="not text"):
+        batch.report_from(_tolerated_report(**change))
+
+
+def test_a_checker_that_did_not_answer_changes_the_signature():
+    def result(missed):
+        case = CaseResult("1", "verified", outcome="technical", problem="the registry did not answer (X), twice",
+                          checker_missed=missed)  # fmt: skip
+        rep = Report("AZ", "Arizona", "t", served=True, cases=[case], problems=[f"1: {case.problem}"])
+        return batch.StateResult(states.get("az"), rep, True)
+
+    assert batch.signature(result(True)) != batch.signature(result(False))

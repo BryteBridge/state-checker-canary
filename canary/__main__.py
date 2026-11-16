@@ -1,4 +1,4 @@
-"""python -m canary plan | check | batch   (see --help on each)."""
+"""python -m canary plan | due | check | batch   (see --help on each)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import batch, gha, issue, pools, publish, states
+from . import batch, due, gha, issue, pools, publish, states
 from .check import COUNT, Checker, markdown
 from .client import CheckerClient, base_url
 
@@ -58,6 +58,20 @@ def cmd_plan(args) -> int:
     return 0
 
 
+def cmd_due(args) -> int:
+    """Whether this run checks the states: always, unless a scheduled run comes too soon
+    after the last batch (canary/due.py). Writes due=true|false to --github-output."""
+    token, repo = os.environ.get("GH_TOKEN", ""), os.environ.get("GITHUB_REPOSITORY", "")
+    gh = issue.GitHub(repo, token) if token and "/" in repo else None
+    workflow = os.environ.get("GITHUB_WORKFLOW_REF", "").split("@", 1)[0].rsplit("/", 1)[-1] or "check.yml"
+    is_due, why = due.due(gh, event=args.event, workflow=workflow, current_run=os.environ.get("GITHUB_RUN_ID", ""))
+    gha.annotate("notice", "Batch due" if is_due else "Batch not due", why)
+    if args.github_output:
+        with open(args.github_output, "a", encoding="utf-8") as f:
+            f.write(f"due={'true' if is_due else 'false'}\n")
+    return 0
+
+
 def cmd_check(args) -> int:
     state = states.get(args.state)
     base = base_url(os.environ.get("CHECKER_BASE_URL"))
@@ -96,19 +110,38 @@ def cmd_batch(args) -> int:
         with open(args.summary, "a", encoding="utf-8") as f:
             f.write(text)
     errors: list[str] = []
+    full = batch.covers_all(results)
+    down = batch.outage(results) if full else []
     if args.issues:
         gh = issue.GitHub(os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GH_TOKEN", ""))
         owner = os.environ.get("GITHUB_REPOSITORY_OWNER") or None
         link = run_url or "(run link unavailable)"
+        in_outage = {r.state.code for r in down}
         for r in results:
+            if r.state.code in in_outage:  # the outage issue speaks for it; its own issue is left as it is
+                print(f"{r.state.code.upper()}: failing; part of the outage")
+                continue
             body = f"{r.body}\n[Batch run]({link})\n"
             try:
-                did = issue.sync(gh, r.state, failed=r.failed, body=body, run_url=link, assignee=owner)
+                did = issue.sync(gh, r.state, failed=r.failed, body=body, run_url=link, assignee=owner,
+                                 sig=batch.signature(r), when=when)  # fmt: skip
             except issue.GitHubError as e:  # one state's issue must not stop the others'
                 errors.append(f"{r.state.code.upper()}: {e}")
                 continue
             print(f"{r.state.code.upper()}: {did}")
+        title, text = batch.outage_text(down, results, run_url)
+        served = sum(1 for r in results if r.state.served)
+        try:
+            if full:  # a batch of a few states can neither start nor end an outage
+                sig = batch.outage_signature(down, served)
+                did = issue.sync_outage(gh, active=bool(down), title=title, body=text, run_url=link,
+                                        assignee=owner, sig=sig, when=when)  # fmt: skip
+                print(f"Outage: {did}")
+        except issue.GitHubError as e:
+            errors.append(f"outage: {e}")
     failed = [r.state.code.upper() for r in results if r.failed]
+    if down:
+        gha.annotate("error", "Outage", f"{len(down)} states failing together: they share the cause")
     if failed:
         gha.annotate("error", "State checks failed", f"{len(failed)} of {len(results)}: {', '.join(failed)}")
     for e in errors:
@@ -151,6 +184,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("plan", help="print the batch's states as a JSON matrix")
     p.add_argument("--states", default="all", help='"all" or a comma list of codes, e.g. "oh,wa"')
     p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("due", help="whether this run checks the states (env GH_TOKEN, GITHUB_REPOSITORY)")
+    p.add_argument("--event", required=True, help="the event that started the run (github.event_name)")
+    p.add_argument("--github-output", help="append due=true|false here (GITHUB_OUTPUT)")
+    p.set_defaults(func=cmd_due)
 
     p = sub.add_parser("check", help="check one state through the deployed checker (env CHECKER_BASE_URL)")
     p.add_argument("--state", required=True)
