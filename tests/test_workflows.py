@@ -17,9 +17,17 @@ def test_25_states_with_unique_codes():
     assert len(states.BY_CODE) == 25
 
 
-def test_the_batch_runs_every_interval_off_the_hour():
+def test_the_workflow_starts_every_hour_off_the_hour_and_checks_only_when_due():
     minute, hours = re.search(r'cron: "(\d+) (\S+) \* \* \*"', CHECK).groups()
-    assert hours == f"*/{states.INTERVAL_HOURS}" and minute != "0"
+    assert hours == "*" and minute != "0"
+    assert "if: ${{ needs.plan.outputs.due == 'true' }}" in CHECK
+    assert "needs.plan.outputs.due == 'true' }}" in CHECK.split("\n  summary:\n", 1)[1]
+
+
+def test_only_the_plan_job_reads_actions():
+    jobs = CHECK.split("\njobs:\n", 1)[1]
+    blocks = re.split(r"\n  (?=[a-z]+:\n)", jobs)
+    assert [b.split(":", 1)[0].strip() for b in blocks if "actions: read" in b] == ["plan"]
 
 
 def test_one_state_never_stops_another():

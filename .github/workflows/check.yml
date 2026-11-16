@@ -1,7 +1,12 @@
-# State checks: one batch every 3 hours, one job per state, one summary.
+# State checks: one batch about every 3 hours, one job per state, one summary.
 #
 #   plan ── check (one job per state, in parallel) ── batch summary
 #
+# - GitHub starts this every hour; plan lets a scheduled start check the states
+#   only when the last batch started 2.5 hours ago or more (canary/due.py), so
+#   batches stay close to 3 hours apart when GitHub drops some hourly starts
+#   (best effort: nothing runs while it drops them all).
+#   A start that is not due ends after plan, green, and checks nothing.
 # - plan lists the batch's states from canary/states.py (all of them, or the
 #   ones a manual run names), so a new state gets its job without an edit here.
 # - Each state's job runs `python -m canary check`: live lookups through the
@@ -22,8 +27,9 @@ run-name: ${{ github.event_name == 'schedule' && 'Scheduled batch' || format('Ma
 
 on:
   schedule:
-    # Every 3 hours at :17, off the top of the hour, when GitHub delays queued runs.
-    - cron: "17 */3 * * *"
+    # Every hour at :17, off the top of the hour, when GitHub delays queued runs; a start
+    # checks the states only when a batch is due (plan, canary/due.py).
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       states:
@@ -51,8 +57,10 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read # check out this repository
+      actions: read # when the last batch ran (canary/due.py)
     outputs:
       states: ${{ steps.plan.outputs.states }}
+      due: ${{ steps.due.outputs.due }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -66,10 +74,16 @@ jobs:
         run: |
           states=$(python -m canary plan --states "$STATES")
           echo "states=$states" >> "$GITHUB_OUTPUT"
+      - id: due
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: python -m canary due --event "$EVENT" --github-output "$GITHUB_OUTPUT"
 
   check:
     name: ${{ matrix.state.name }}
     needs: plan
+    if: ${{ needs.plan.outputs.due == 'true' }}
     runs-on: ubuntu-24.04
     # The check stops starting lookups after 20 minutes (check.BUDGET_SECONDS) and
     # its step times out at 25, leaving time to upload whatever it wrote; a state
@@ -128,7 +142,7 @@ jobs:
   summary:
     name: Batch summary
     needs: [plan, check]
-    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.due == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

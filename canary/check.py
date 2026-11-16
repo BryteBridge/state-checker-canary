@@ -17,12 +17,17 @@ What fails the run (someone has to act):
 - the checker unreachable, or its configuration unreadable;
 - a state served or not served against what states.py says;
 - an answer that is malformed, not live when asked live, or not verified (a
-  pool entity the checker cannot find, or a registry not answering twice);
+  pool entity the checker cannot find, or a registry not answering twice), past
+  the one unanswered lookup in five that only warns (below);
 - storage not serving this run's answer back, or serving it back different;
 - the run's time budget running out, or the check itself crashing.
 
 What only warns (shown in the summary, the run stays green):
 - a state the checker is meant not to serve;
+- one lookup in five (TOLERATE_ONE_IN) whose registry did not answer, twice,
+  when the others answered: a registry's own hiccup, not the checker breaking.
+  From 2026-11-04 to 11-14 every red check was a registry not answering, never
+  a wrong answer, and most of Virginia's were exactly one lookup of five;
 - no answer in this run that storage would serve (inactive entities, and ones
   not open yet, are re-checked live by design).
 """
@@ -67,6 +72,14 @@ ACTION_FOR = {
 }  # fmt: skip
 CAN_FILE_ACTIONS = ("proceed", "proceed_with_warning")
 TRANSIENT_OUTCOMES = ("technical", "local")
+# One lookup in this many may go unanswered by the registry (twice) and only warn,
+# when the others answered: 1 of 5, 2 of 10. Any other problem still fails.
+TOLERATE_ONE_IN = 5
+
+
+def tolerated_limit(cases: int) -> int:
+    """How many unanswered lookups a check of `cases` lookups tolerates."""
+    return cases // TOLERATE_ONE_IN
 
 
 class OutOfTime(Exception):
@@ -87,6 +100,8 @@ class CaseResult:
     observation_id: str | None = None
     answer: dict | None = None  # the fields storage must serve back unchanged
     answered_at: float | None = None  # monotonic, when the live answer came back
+    tolerated: bool = False  # its problem only warns: one unanswered lookup in TOLERATE_ONE_IN
+    checker_missed: bool = False  # an attempt got no answer from the checker itself: never tolerated
 
 
 @dataclass
@@ -248,7 +263,17 @@ class Checker:
                 self.sleep(self.rng.uniform(*SPACING_SECONDS))
             self._time(f"checking {eid}")
             report.cases.append(self._case(state, eid))
-        report.problems += [f"{c.eid}: {c.problem}" for c in report.cases if c.problem]
+        unanswered = [c for c in report.cases if c.problem and c.outcome in TRANSIENT_OUTCOMES and not c.checker_missed]
+        if unanswered and len(unanswered) <= tolerated_limit(len(report.cases)):
+            for c in unanswered:
+                c.tolerated = True
+        report.problems += [f"{c.eid}: {c.problem}" for c in report.cases if c.problem and not c.tolerated]
+        report.warnings += [
+            f"{c.eid}: {c.problem}; tolerated, as one lookup in {TOLERATE_ONE_IN} may go unanswered "
+            "(more fail the check)"
+            for c in report.cases
+            if c.tolerated
+        ]
         self._round_trip(state, report)
 
     def _not_served(self, state: State, report: Report, eid: str) -> None:
@@ -279,6 +304,7 @@ class Checker:
             result.answer = result.answered_at = None
             if not r.ok:
                 result.problem = f"no answer from the checker: {_error(r)}"
+                result.checker_missed = True
                 continue
             body = r.body
             bad = malformed(body, state, eid, basis="live")
@@ -424,7 +450,7 @@ def markdown(report: Report, run_url: str | None = None) -> str:
             "|---|---|---|---|---|---|---|---|",
         ]
     for c in report.cases:
-        result = f"❌ {c.problem}" if c.problem else "✅"
+        result = (f"⚠️ {c.problem} (tolerated)" if c.tolerated else f"❌ {c.problem}") if c.problem else "✅"
         seconds = c.seconds if c.seconds is not None else ""
         lines.append(
             f"| `{_cell(c.eid)}` | {_cell(c.expect)} | {_cell(c.outcome)} | {_cell(c.verdict)} | "

@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# How often a batch runs; must match the cron line in .github/workflows/check.yml.
+# How often a batch runs. GitHub starts the workflow every hour and canary/due.py lets a
+# start check the states when the last batch is about this old.
 INTERVAL_HOURS = 3
 
 

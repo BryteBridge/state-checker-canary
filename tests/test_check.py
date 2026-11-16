@@ -501,3 +501,66 @@ def test_a_refresh_that_turns_unstorable_is_inconclusive_not_adopted():
     report, _ = run(FakeClient(config(), answers))
     assert report.round_trip["passed"] is None
     assert any("inconclusive" in w for w in report.warnings)
+
+
+# one unanswered lookup in five only warns
+
+
+def _five(**overrides):
+    answers = _healthy()
+    for eid in ("300", "400", "500"):
+        answers[(eid, True)] = [answer(verdict="dead", active=False, obs=f"live{eid}")]
+    answers.update(overrides)
+    return answers
+
+
+UNANSWERED = [answer(outcome="technical", verdict="unknown", reason="TECHNICAL_UNREACHABLE")]
+
+
+def test_one_unanswered_lookup_in_five_only_warns():
+    report, _ = run(FakeClient(config(), _five() | {("300", True): UNANSWERED}), count=5)
+    assert report.ok, report.problems
+    assert [c.eid for c in report.cases if c.tolerated] == ["300"]
+    assert any(w.startswith("300: the registry did not answer (TECHNICAL_UNREACHABLE), twice; tolerated")
+               for w in report.warnings)  # fmt: skip
+    assert report.round_trip["passed"] is True
+    assert "⚠️ the registry did not answer (TECHNICAL_UNREACHABLE), twice (tolerated)" in markdown(report)
+
+
+def test_two_unanswered_lookups_in_five_fail_and_neither_is_tolerated():
+    answers = _five() | {("300", True): UNANSWERED, ("400", True): UNANSWERED}
+    report, _ = run(FakeClient(config(), answers), count=5)
+    assert not report.ok
+    assert not any(c.tolerated for c in report.cases)
+    assert sum("did not answer" in p for p in report.problems) == 2
+
+
+def test_all_five_unanswered_fail():
+    answers = {(eid, True): UNANSWERED for eid in ("200", "100", "300", "400", "500")}
+    report, _ = run(FakeClient(config(), answers), count=5)
+    assert len(report.problems) == 5 and not any(c.tolerated for c in report.cases)
+
+
+def test_a_checker_that_does_not_answer_is_never_tolerated():
+    answers = _five() | {("300", True): [Response(None, None, "no answer: timeout", 45.0)]}
+    report, _ = run(FakeClient(config(), answers), count=5)
+    assert not report.ok and not any(c.tolerated for c in report.cases)
+
+
+def test_a_wrong_answer_is_never_tolerated():
+    answers = _five() | {("300", True): [answer(outcome="not_found", verdict="unknown")]}
+    report, _ = run(FakeClient(config(), answers), count=5)
+    assert not report.ok and not any(c.tolerated for c in report.cases)
+
+
+def test_fewer_than_five_lookups_tolerate_nothing():
+    answers = _healthy() | {("100", True): UNANSWERED}
+    report, _ = run(FakeClient(config(), answers), count=2)
+    assert not report.ok and not report.cases[1].tolerated
+
+
+def test_a_checker_miss_then_a_registry_miss_is_not_tolerated():
+    answers = _five() | {("300", True): [Response(None, None, "no answer: timeout", 45.0), *UNANSWERED]}
+    report, _ = run(FakeClient(config(), answers), count=5)
+    case = report.cases[2]
+    assert case.checker_missed and not case.tolerated and not report.ok
