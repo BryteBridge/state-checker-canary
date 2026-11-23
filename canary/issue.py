@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 
+from . import gha
 from .states import State
 
 API = "https://api.github.com"
@@ -158,6 +159,11 @@ def _open(gh: GitHub, *, title: str, body: str, label_list: list[str], assignee:
             return issue["number"]
         if not _refused_assignee(issue):
             raise GitHubError(f"POST /issues: HTTP 422: {json.dumps(issue)[:300]}")
+        gha.annotate(
+            "warning",
+            "Issue assignee refused",
+            f"GitHub cannot assign {assignee} here; the issue opens unassigned (set CANARY_ASSIGNEE)",
+        )
     _, issue = gh.call("POST", "/issues", new)
     return issue["number"]
 

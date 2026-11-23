@@ -76,10 +76,11 @@ def test_failure_with_no_issue_opens_one_with_both_labels_assigned_to_the_owner(
     assert api.requests[0][1].startswith("/issues?") and "labels=canary-az" in api.requests[0][1]
 
 
-def test_an_assignee_github_refuses_still_opens_the_issue_unassigned():
+def test_an_assignee_github_refuses_still_opens_the_issue_unassigned(capsys):
     # the repository moved to an organization: GitHub answers 422 on `assignees`
     api = FakeGitHubAPI(refuse_assignee=True)
     assert sync(gh(api), AZ, failed=True, body="B", run_url="U", assignee="SomeOrg") == "failing; opened #7"
+    assert "::warning title=Issue assignee refused::GitHub cannot assign SomeOrg" in capsys.readouterr().out
     posts = [b for m, p, b in api.requests if (m, p) == ("POST", "/issues")]
     assert [("assignees" in b) for b in posts] == [True, False]
     assert posts[1]["labels"] == ["canary", "canary-az"] and posts[1]["title"] == posts[0]["title"]
