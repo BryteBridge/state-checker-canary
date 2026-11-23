@@ -15,10 +15,12 @@ AZ = states.get("az")
 class FakeGitHubAPI:
     """Records requests; answers from a small in-memory issue list."""
 
-    def __init__(self, issues=None, fail=None):
+    def __init__(self, issues=None, fail=None, refuse_assignee=False, refuse_issue=False):
         self.issues = issues or []
         self.requests: list[tuple[str, str, dict | None]] = []
         self.fail = fail
+        self.refuse_assignee = refuse_assignee  # GitHub's answer for an organization as assignee
+        self.refuse_issue = refuse_issue  # a 422 about something else
 
     def __call__(self, req, timeout):
         body = json.loads(req.data) if req.data else None
@@ -32,8 +34,18 @@ class FakeGitHubAPI:
         if path == "/labels":
             return Resp(422, {"message": "exists"}) if body["name"] == "canary" else Resp(201, {})
         if path == "/issues":
+            if self.refuse_issue:
+                raise _invalid(req, "labels")
+            if self.refuse_assignee and "assignees" in body:
+                raise _invalid(req, "assignees")
             return Resp(201, {"number": 7})
         return Resp(200, {})
+
+
+def _invalid(req, field):
+    """GitHub's 422 for a field it refuses (an organization as assignee, say)."""
+    answer = {"message": "Validation Failed", "errors": [{"resource": "Issue", "field": field, "code": "invalid"}]}
+    return urllib.error.HTTPError(req.full_url, 422, "no", {}, io.BytesIO(json.dumps(answer).encode()))
 
 
 class Resp:
@@ -62,6 +74,30 @@ def test_failure_with_no_issue_opens_one_with_both_labels_assigned_to_the_owner(
     assert body["labels"] == ["canary", "canary-az"] and body["title"].startswith("AZ (Arizona)")
     assert body["assignees"] == ["me"]
     assert api.requests[0][1].startswith("/issues?") and "labels=canary-az" in api.requests[0][1]
+
+
+def test_an_assignee_github_refuses_still_opens_the_issue_unassigned(capsys):
+    # the repository moved to an organization: GitHub answers 422 on `assignees`
+    api = FakeGitHubAPI(refuse_assignee=True)
+    assert sync(gh(api), AZ, failed=True, body="B", run_url="U", assignee="SomeOrg") == "failing; opened #7"
+    assert "::warning title=Issue assignee refused::GitHub cannot assign SomeOrg" in capsys.readouterr().out
+    posts = [b for m, p, b in api.requests if (m, p) == ("POST", "/issues")]
+    assert [("assignees" in b) for b in posts] == [True, False]
+    assert posts[1]["labels"] == ["canary", "canary-az"] and posts[1]["title"] == posts[0]["title"]
+
+
+def test_an_outage_issue_with_a_refused_assignee_opens_unassigned():
+    api = FakeGitHubAPI(refuse_assignee=True)
+    did = sync_outage(gh(api), active=True, title="T", body="B", run_url="U", assignee="SomeOrg")
+    assert did == "outage; opened #7"
+    assert "assignees" not in api.requests[-1][2]
+
+
+def test_a_422_about_anything_else_is_still_an_error():
+    api = FakeGitHubAPI(refuse_issue=True)
+    with pytest.raises(GitHubError, match="labels"):
+        sync(gh(api), AZ, failed=True, body="B", run_url="U", assignee="me")
+    assert sum(1 for m, p, _ in api.requests if (m, p) == ("POST", "/issues")) == 1
 
 
 def _marked(sig, runs=3, since="2026-11-10 06:00 UTC"):

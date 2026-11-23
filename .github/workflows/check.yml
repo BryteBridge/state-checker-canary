@@ -20,7 +20,8 @@
 # - The batch summary also pushes the results to the checker's console, signed
 #   (canary/publish.py): nothing polls GitHub, and a push that fails is a red job.
 # - Fails loudly: the state's red job, an error annotation per problem, the
-#   batch table, the state's issue (assigned to the repository owner), and
+#   batch table, the state's issue (assigned to vars.CANARY_ASSIGNEE, else the
+#   repository owner, else no one when GitHub refuses the assignee), and
 #   GitHub's failure email for scheduled runs.
 name: State checks
 run-name: ${{ github.event_name == 'schedule' && 'Scheduled batch' || format('Manual batch ({0})', inputs.states) }}
@@ -169,6 +170,7 @@ jobs:
       - name: Summarize the batch, update each state's issue, push to the console
         env:
           GH_TOKEN: ${{ github.token }}
+          CANARY_ASSIGNEE: ${{ vars.CANARY_ASSIGNEE }}
           PLAN: ${{ needs.plan.outputs.states }}
           ON_MAIN: ${{ github.ref == 'refs/heads/main' }}
           CHECKER_BASE_URL: ${{ secrets.CHECKER_BASE_URL }}

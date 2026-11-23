@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 
+from . import gha
 from .states import State
 
 API = "https://api.github.com"
@@ -148,11 +149,29 @@ def _close(gh: GitHub, found: dict | None, text: str) -> str:
 
 
 def _open(gh: GitHub, *, title: str, body: str, label_list: list[str], assignee: str | None, sig: str, when: str):
+    """The new issue's number. An assignee GitHub refuses (an organization, say, once the
+    repository moved to one: HTTP 422 on `assignees`) never costs the alert: the issue
+    is opened without one."""
     new = {"title": title, "body": _text(body, since=when, runs=1, sig=sig), "labels": label_list}
     if assignee:
-        new["assignees"] = [assignee]
+        status, issue = gh.call("POST", "/issues", dict(new, assignees=[assignee]), ok=(201, 422))
+        if status == 201:
+            return issue["number"]
+        if not _refused_assignee(issue):
+            raise GitHubError(f"POST /issues: HTTP 422: {json.dumps(issue)[:300]}")
+        gha.annotate(
+            "warning",
+            "Issue assignee refused",
+            f"GitHub cannot assign {assignee} here; the issue opens unassigned (set CANARY_ASSIGNEE)",
+        )
     _, issue = gh.call("POST", "/issues", new)
     return issue["number"]
+
+
+def _refused_assignee(answer) -> bool:
+    """A 422 whose only complaint is the assignee."""
+    errors = answer.get("errors") if isinstance(answer, dict) else None
+    return bool(errors) and all(isinstance(e, dict) and e.get("field") == "assignees" for e in errors)
 
 
 def sync(
@@ -167,7 +186,7 @@ def sync(
     when: str = "",
 ) -> str:
     """Open, update or close the state's issue. Returns what it did. A new issue is
-    assigned to `assignee` (the repository owner), so GitHub notifies them; a later
+    assigned to `assignee` (when GitHub accepts it), so GitHub notifies them; a later
     failure comments (and so notifies) only when its signature `sig` changed."""
     group, own = labels(state)
     found = gh.open_issue(own)
