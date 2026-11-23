@@ -114,7 +114,9 @@ def cmd_batch(args) -> int:
     down = batch.outage(results) if full else []
     if args.issues:
         gh = issue.GitHub(os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GH_TOKEN", ""))
-        owner = os.environ.get("GITHUB_REPOSITORY_OWNER") or None
+        # who a new issue is assigned to: CANARY_ASSIGNEE (a repository variable), else the
+        # owner; an organization owner cannot be assigned, and the issue then opens without one
+        owner = os.environ.get("CANARY_ASSIGNEE", "").strip() or os.environ.get("GITHUB_REPOSITORY_OWNER") or None
         link = run_url or "(run link unavailable)"
         in_outage = {r.state.code for r in down}
         for r in results:

@@ -153,6 +153,19 @@ def synced(monkeypatch):
     return seen
 
 
+def test_the_assignee_variable_wins_over_the_owner(tmp_path, synced, monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY_OWNER", "SomeOrg")
+    monkeypatch.setenv("CANARY_ASSIGNEE", " a-person ")
+    cli.main(["batch", "--plan", _plan("ct"), "--reports", str(tmp_path), "--issues"])
+    assert synced["ct"]["assignee"] == "a-person"
+
+
+def test_an_empty_assignee_variable_falls_back_to_the_owner(tmp_path, synced, monkeypatch):
+    monkeypatch.setenv("CANARY_ASSIGNEE", "")  # an unset repository variable arrives empty
+    cli.main(["batch", "--plan", _plan("ct"), "--reports", str(tmp_path), "--issues"])
+    assert synced["ct"]["assignee"] == "someone"
+
+
 def test_batch_summarizes_and_syncs_every_planned_state(tmp_path, synced, capsys):
     good = Report("AZ", "Arizona", "t", served=True)
     bad = Report("CA", "California", "t", served=True, problems=["200: wrong"])
